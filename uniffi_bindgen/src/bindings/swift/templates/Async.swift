@@ -3,38 +3,52 @@ private let UNIFFI_RUST_FUTURE_POLL_WAKE: Int8 = 1
 
 fileprivate let uniffiContinuationHandleMap = UniffiHandleMap<UnsafeContinuation<Int8, Never>>()
 
-fileprivate func uniffiRustCallAsync<F, T>(
+// Keep the handle alive until both polling and the cancellation handler finish.
+private final class UniffiRustFuture: Sendable {
+    let handle: UInt64
+    private let free: @Sendable (UInt64) -> Void
+
+    init(_ handle: UInt64, free: @escaping @Sendable (UInt64) -> Void) {
+        self.handle = handle
+        self.free = free
+    }
+
+    deinit { free(handle) }
+}
+
+func uniffiRustCallAsync<F, T>(
     rustFutureFunc: () -> UInt64,
-    pollFunc: (UInt64, @escaping UniffiRustFutureContinuationCallback, UInt64) -> (),
+    pollFunc: (UInt64, @escaping UniffiRustFutureContinuationCallback, UInt64) -> Void,
     completeFunc: (UInt64, UnsafeMutablePointer<RustCallStatus>) -> F,
-    freeFunc: (UInt64) -> (),
+    cancelFunc: @Sendable (UInt64) -> Void,
+    freeFunc: @escaping @Sendable (UInt64) -> Void,
     liftFunc: (F) throws -> T,
     errorHandler: ((RustBuffer) throws -> Swift.Error)?
 ) async throws -> T {
-    // Make sure to call the ensure init function since future creation doesn't have a
-    // RustCallStatus param, so doesn't use makeRustCall()
+    // Infallible Swift bindings use try! and cannot return CancellationError.
+    let supportsCancellation = errorHandler != nil
+    if supportsCancellation { try Task.checkCancellation() }
     {{ ensure_init_fn_name }}()
-    let rustFuture = rustFutureFunc()
-    defer {
-        freeFunc(rustFuture)
-    }
-    var pollResult: Int8;
-    repeat {
-        pollResult = await withUnsafeContinuation {
-            pollFunc(
-                rustFuture,
-                { handle, pollResult in
-                    uniffiFutureContinuationCallback(handle: handle, pollResult: pollResult)
-                },
-                uniffiContinuationHandleMap.insert(obj: $0)
-            )
+    let future = UniffiRustFuture(rustFutureFunc(), free: freeFunc)
+    return try await withTaskCancellationHandler {
+        var pollResult: Int8
+        repeat {
+            pollResult = await withUnsafeContinuation {
+                pollFunc(future.handle, uniffiFutureContinuationCallback, uniffiContinuationHandleMap.insert(obj: $0))
+            }
+        } while pollResult != UNIFFI_RUST_FUTURE_POLL_READY
+        // Consume the FFI value or error buffer even if Swift will discard the result.
+        let result = Result {
+            try liftFunc(makeRustCall(
+                { completeFunc(future.handle, $0) },
+                errorHandler: errorHandler
+            ))
         }
-    } while pollResult != UNIFFI_RUST_FUTURE_POLL_READY
-
-    return try liftFunc(makeRustCall(
-        { completeFunc(rustFuture, $0) },
-        errorHandler: errorHandler
-    ))
+        if supportsCancellation { try Task.checkCancellation() }
+        return try result.get()
+    } onCancel: {
+        if supportsCancellation { cancelFunc(future.handle) }
+    }
 }
 
 // Callback handlers for an async calls.  These are invoked by Rust when the future is ready.  They

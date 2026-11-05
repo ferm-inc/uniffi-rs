@@ -8,10 +8,17 @@ internal val uniffiContinuationHandleMap = UniffiHandleMap<CancellableContinuati
 // FFI type for Rust future continuations
 internal object uniffiRustFutureContinuationCallbackImpl: UniffiRustFutureContinuationCallback {
     override fun callback(data: Long, pollResult: Byte) {
-        uniffiContinuationHandleMap.remove(data).resume(pollResult)
+        val continuation = uniffiContinuationHandleMap.remove(data)
+        // UniFFI holds its scheduler mutex during this callback. Unconfined (or
+        // an immediate dispatcher) may otherwise resume inline and re-enter poll
+        // or free while that mutex is held. Always dispatch, even on a worker.
+        kotlinx.coroutines.Dispatchers.Default.dispatch(kotlin.coroutines.EmptyCoroutineContext, Runnable {
+            continuation.resume(pollResult)
+        })
     }
 }
 
+@OptIn(kotlinx.coroutines.InternalCoroutinesApi::class)
 internal suspend fun<T, F, E: kotlin.Exception> uniffiRustCallAsync(
     rustFuture: Long,
     pollFunc: (Long, UniffiRustFutureContinuationCallback, Long) -> Unit,
@@ -21,20 +28,41 @@ internal suspend fun<T, F, E: kotlin.Exception> uniffiRustCallAsync(
     errorHandler: UniffiRustCallStatusErrorHandler<E>
 ): T {
     try {
-        do {
-            val pollResult = suspendCancellableCoroutine<Byte> { continuation ->
-                pollFunc(
-                    rustFuture,
-                    uniffiRustFutureContinuationCallbackImpl,
-                    uniffiContinuationHandleMap.insert(continuation)
-                )
-            }
-        } while (pollResult != UNIFFI_RUST_FUTURE_POLL_READY);
+        var cancellation: kotlinx.coroutines.CancellationException? = null
+        try {
+            do {
+                val pollResult = suspendCancellableCoroutine<Byte> { continuation ->
+                    pollFunc(
+                        rustFuture,
+                        uniffiRustFutureContinuationCallbackImpl,
+                        uniffiContinuationHandleMap.insert(continuation)
+                    )
+                }
+            } while (pollResult != UNIFFI_RUST_FUTURE_POLL_READY)
+        } catch (error: kotlinx.coroutines.CancellationException) {
+            cancellation = error
+        }
 
-        return liftFunc(
-            uniffiRustCallWithError(errorHandler, { status -> completeFunc(rustFuture, status) })
-        )
+        // Complete even after cancellation: this consumes a ready FFI value/error,
+        // or drops a pending Rust future without waiting for its operation to finish.
+        val result = runCatching {
+            liftFunc(uniffiRustCallWithError(errorHandler) { status ->
+                completeFunc(rustFuture, status)
+            })
+        }
+        try {
+            cancellation?.let { throw it }
+            val job = kotlin.coroutines.coroutineContext[Job]
+            if (job != null && !job.isActive) throw job.getCancellationException()
+        } catch (error: kotlinx.coroutines.CancellationException) {
+            // Kotlin has no ARC. A constructor result that never reaches the caller
+            // must be explicitly closed, even though its FFI handle was lifted.
+            Disposable.destroy(result.getOrNull())
+            throw error
+        }
+        return result.getOrThrow()
     } finally {
+        // Also releases a pending poll callback from the continuation handle map.
         freeFunc(rustFuture)
     }
 }
